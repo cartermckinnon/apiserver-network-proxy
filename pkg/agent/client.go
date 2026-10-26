@@ -551,7 +551,13 @@ func (a *Client) Serve() {
 
 			eConn, ok := a.connManager.Get(connID)
 			if ok {
-				eConn.cleanup()
+				// cleanup waits for the connection's queued DATA to be flushed to
+				// the proxy server and then sends CLOSE_RSP, both of which block
+				// while the shared stream is flow-control limited. Run it off the
+				// receive loop so one closing connection does not stall packets
+				// for every other connection on this stream. cleanup is
+				// idempotent and already runs on other goroutines.
+				go eConn.cleanup()
 			} else {
 				klog.V(4).InfoS("Failed to find connection context for close", "connectionID", connID)
 				resp := &client.Packet{

@@ -232,6 +232,141 @@ func TestClose_Client(t *testing.T) {
 
 }
 
+// TestServe_CloseRequestDoesNotBlockReceiveLoop verifies that handling a
+// CLOSE_REQ whose close handshake cannot currently complete (the shared stream
+// is not accepting sends) does not stall the receive loop, so DATA for other
+// connections on the same stream still reaches their endpoints.
+func TestServe_CloseRequestDoesNotBlockReceiveLoop(t *testing.T) {
+	stopCh := make(chan struct{})
+	cs := &ClientSet{
+		clients: make(map[string]*Client),
+		stopCh:  stopCh,
+	}
+	testClient := &Client{
+		connManager: newConnectionManager(),
+		stopCh:      stopCh,
+		cs:          cs,
+	}
+	var stream *fakeStream
+	testClient.stream, stream = pipe()
+	go testClient.Serve()
+	defer close(stopCh)
+
+	// idleAddr accepts connections and never writes to them.
+	idleAddr := serveTCP(t, func(c net.Conn) { _, _ = io.Copy(io.Discard, c) })
+	// sinkAddr records what the connection under test delivers.
+	received := make(chan string, 1)
+	sinkAddr := serveTCP(t, func(c net.Conn) {
+		buf := make([]byte, len("hello"))
+		if _, err := io.ReadFull(c, buf); err == nil {
+			received <- string(buf)
+		}
+	})
+
+	dial := func(dialID int64, addr string) int64 {
+		t.Helper()
+		if err := stream.Send(newDialPacket("tcp", addr, dialID)); err != nil {
+			t.Fatal(err)
+		}
+		pkt, err := stream.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pkt.Type != client.PacketType_DIAL_RSP || pkt.GetDialResponse().Random != dialID {
+			t.Fatalf("unexpected packet %v", pkt)
+		}
+		return pkt.GetDialResponse().ConnectID
+	}
+	closingConnID := dial(1, idleAddr)
+	sinkConnID := dial(2, sinkAddr)
+
+	// Stop reading from the stream and make the agent send more DIAL_RSPs than
+	// the stream buffers. The last one blocks holding the send lock, so any
+	// further send to the proxy server, including a CLOSE_RSP, blocks too.
+	for i := int64(0); i <= int64(cap(stream.r)); i++ {
+		if err := stream.Send(newDialPacket("tcp", idleAddr, 100+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wait.PollImmediate(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+		return len(stream.r) == cap(stream.r), nil
+	}); err != nil {
+		t.Fatal("agent never filled the stream buffer")
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// The close handshake for this connection cannot finish until the stream
+	// is read again. The DATA that follows must not wait for it.
+	if err := stream.Send(newClosePacket(closingConnID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(newDataPacket(sinkConnID, []byte("hello"))); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if got != "hello" {
+			t.Fatalf("sink received %q, want %q", got, "hello")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("DATA for an unrelated connection was blocked behind a CLOSE_REQ")
+	}
+
+	// Resume reading so the close handshake can complete.
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for {
+			pkt, err := stream.Recv()
+			if err != nil {
+				return
+			}
+			if pkt.Type == client.PacketType_CLOSE_RSP && pkt.GetCloseResponse().ConnectID == closingConnID {
+				return
+			}
+		}
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("never received CLOSE_RSP for the closed connection")
+	}
+	waitForConnectionDeletion(t, testClient, closingConnID)
+}
+
+// serveTCP listens on an ephemeral port and runs handle for each accepted
+// connection until the test ends. It returns the listen address.
+func serveTCP(t *testing.T, handle func(net.Conn)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conns sync.Mutex
+	var open []net.Conn
+	t.Cleanup(func() {
+		ln.Close()
+		conns.Lock()
+		defer conns.Unlock()
+		for _, c := range open {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conns.Lock()
+			open = append(open, c)
+			conns.Unlock()
+			go handle(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
 func TestConnectionMismatch(t *testing.T) {
 	var stream agent.AgentService_ConnectClient
 	stopCh := make(chan struct{})

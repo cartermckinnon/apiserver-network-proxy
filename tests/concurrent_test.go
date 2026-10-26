@@ -28,13 +28,22 @@ import (
 )
 
 func TestProxy_ConcurrencyGRPC(t *testing.T) {
+	testProxyConcurrencyGRPC(t, runGRPCProxyServer)
+}
+
+func TestProxy_ConcurrencyGRPCWithoutWriteQueue(t *testing.T) {
+	testProxyConcurrencyGRPC(t, runGRPCProxyServerWithoutWriteQueue)
+}
+
+func testProxyConcurrencyGRPC(t *testing.T, startProxy func(testing.TB) framework.ProxyServer) {
+	t.Helper()
 	ctx := context.Background()
 	length := 1 << 20
 	chunks := 10
 	server := httptest.NewServer(newSizedServer(length, chunks))
 	defer server.Close()
 
-	ps := runGRPCProxyServer(t)
+	ps := startProxy(t)
 	defer ps.Stop()
 
 	a := runAgent(t, ps.AgentAddr())

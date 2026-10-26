@@ -863,6 +863,25 @@ func runGRPCProxyServerWithServerCount(t testing.TB, serverCount int) framework.
 	return ps
 }
 
+func runGRPCProxyServerWithoutWriteQueue(t testing.TB) framework.ProxyServer {
+	size := 0
+	return runGRPCProxyServerWithWriteQueueSize(t, &size)
+}
+
+func runGRPCProxyServerWithWriteQueueSize(t testing.TB, size *int) framework.ProxyServer {
+	t.Helper()
+	opts := framework.ProxyServerOpts{
+		Mode:                     server.ModeGRPC,
+		ServerCount:              1,
+		FrontendWriteChannelSize: size,
+	}
+	ps, err := Framework.ProxyServerRunner.Start(t, opts)
+	if err != nil {
+		t.Fatalf("Failed to start gRPC proxy server: %v", err)
+	}
+	return ps
+}
+
 func runHTTPConnProxyServer(t testing.TB) framework.ProxyServer {
 	return runHTTPConnProxyServerWithWriteQueueSize(t, nil)
 }

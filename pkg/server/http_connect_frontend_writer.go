@@ -30,6 +30,8 @@ import (
 
 const defaultFrontendWriteChannelSize = 10
 
+// frontendWriteQueueMetrics tracks one frontend write queue's contribution to
+// the full-queue gauge. It is shared by the gRPC and HTTP-CONNECT adapters.
 type frontendWriteQueueMetrics struct {
 	mu   sync.Mutex
 	full bool // guarded by mu
@@ -38,10 +40,53 @@ type frontendWriteQueueMetrics struct {
 	stopped   bool             // guarded by mu
 }
 
+// observe samples whether queue is currently full and moves the gauge on each
+// transition. It is a no-op once stop has been called.
+func (state *frontendWriteQueueMetrics) observe(queue chan *client.Packet) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.stopped {
+		return
+	}
+	// Sample under the lock, even when the caller's own operation did not
+	// change fullness: a concurrent update which sampled earlier could
+	// otherwise publish stale occupancy after we return.
+	full := len(queue) == cap(queue)
+	if state.full == full {
+		return
+	}
+
+	state.full = full
+	if full {
+		state.fullGauge = metrics.Metrics.FullFrontendWriteQueues()
+		state.fullGauge.Inc()
+	} else {
+		state.fullGauge.Dec()
+		state.fullGauge = nil
+	}
+}
+
+// stop releases the durable full-queue accounting and ignores later updates.
+func (state *frontendWriteQueueMetrics) stop() {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.stopped {
+		return
+	}
+
+	state.stopped = true
+	if state.full {
+		state.full = false
+		state.fullGauge.Dec()
+		state.fullGauge = nil
+	}
+}
+
 // enqueueWrite gives each HTTP-CONNECT stream a bounded response buffer behind
 // the common Frontend.Send path. When it fills, Send blocks without dropping
 // packets or disconnecting a slow client. This delays, rather than eliminates,
-// head-of-line blocking of the shared agent receive loop.
+// head-of-line blocking of the shared agent receive loop. gRPC frontends get
+// the same treatment from grpcFrontendStream.
 func (h *httpConnectStream) enqueueWrite(pkt *client.Packet) error {
 	select {
 	case <-h.closed:
@@ -107,43 +152,11 @@ func (h *httpConnectStream) serveFrontendWrites() {
 }
 
 func (h *httpConnectStream) updateFrontendWriteQueueMetric() {
-	state := &h.writeMetrics
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.stopped {
-		return
-	}
-	// Check under the lock even when unchanged: skipping a concurrent update
-	// could otherwise let it publish stale occupancy after we return.
-	full := len(h.writeCh) == cap(h.writeCh)
-	if state.full == full {
-		return
-	}
-
-	state.full = full
-	if full {
-		state.fullGauge = metrics.Metrics.FullFrontendWriteQueues()
-		state.fullGauge.Inc()
-	} else {
-		state.fullGauge.Dec()
-		state.fullGauge = nil
-	}
+	h.writeMetrics.observe(h.writeCh)
 }
 
 // stopFrontendWriteQueueMetric releases the durable full-queue accounting.
 // Stream closure releases it even when the socket writer is still blocked.
 func (h *httpConnectStream) stopFrontendWriteQueueMetric() {
-	state := &h.writeMetrics
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.stopped {
-		return
-	}
-
-	state.stopped = true
-	if state.full {
-		state.full = false
-		state.fullGauge.Dec()
-		state.fullGauge = nil
-	}
+	h.writeMetrics.stop()
 }
